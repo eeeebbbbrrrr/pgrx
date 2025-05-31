@@ -7,6 +7,8 @@
 //LICENSE All rights reserved.
 //LICENSE
 //LICENSE Use of this source code is governed by the MIT license that can be found in the LICENSE file.
+use crate::clang_ast::{parse_ast, SymbolLookup};
+use crate::stdout_capture::StdoutCapture;
 use bindgen::callbacks::{DeriveTrait, EnumVariantValue, ImplementsTrait, MacroParsingBehavior};
 use bindgen::NonCopyUnionStyle;
 use eyre::{eyre, WrapErr};
@@ -326,8 +328,9 @@ fn generate_bindings(
     include_h.push("include");
     include_h.push(format!("pg{major_version}.h"));
 
-    let bindgen_output = get_bindings(major_version, pg_config, &include_h, enable_cshim)
-        .wrap_err_with(|| format!("bindgen failed for pg{major_version}"))?;
+    let (bindgen_output, symbol_lookup) =
+        get_bindings(major_version, pg_config, &include_h, enable_cshim)
+            .wrap_err_with(|| format!("bindgen failed for pg{major_version}"))?;
 
     let oids = extract_oids(&bindgen_output);
     let rewritten_items = rewrite_items(bindgen_output, &oids)
@@ -765,23 +768,32 @@ fn get_bindings(
     pg_config: &PgConfig,
     include_h: &path::Path,
     enable_cshim: bool,
-) -> eyre::Result<syn::File> {
-    let bindings = if let Some(info_dir) =
+) -> eyre::Result<(syn::File, Option<SymbolLookup>)> {
+    let (bindings, symbol_lookup) = if let Some(info_dir) =
         target_env_tracked(&format!("PGRX_TARGET_INFO_PATH_PG{major_version}"))
     {
         let bindings_file = format!("{info_dir}/pg{major_version}_raw_bindings.rs");
-        std::fs::read_to_string(&bindings_file)
-            .wrap_err_with(|| format!("failed to read raw bindings from {bindings_file}"))?
+        let bindings = std::fs::read_to_string(&bindings_file)
+            .wrap_err_with(|| format!("failed to read raw bindings from {bindings_file}"))?;
+        (bindings, None)
     } else {
-        let bindings = run_bindgen(major_version, pg_config, include_h, enable_cshim)?;
+        let (bindings, ast) = run_bindgen(major_version, pg_config, include_h, enable_cshim)?;
         if let Some(path) = env_tracked("PGRX_PG_SYS_EXTRA_OUTPUT_PATH") {
             std::fs::write(path, &bindings)?;
         }
-        bindings
+
+        let target_includes = pg_target_includes(major_version, pg_config)?;
+        let symbol_lookup = parse_ast(target_includes, ast)?;
+
+        (bindings, Some(symbol_lookup))
     };
-    syn::parse_file(bindings.as_str()).wrap_err_with(|| "failed to parse generated bindings")
+    syn::parse_file(bindings.as_str())
+        .wrap_err_with(|| "failed to parse generated bindings")
+        .map(|bindings| (bindings, symbol_lookup))
 }
 
+type Bindings = String;
+type ClangAST = String;
 /// Given a specific postgres version, `run_bindgen` generates bindings for the given
 /// postgres version and returns them as a token stream.
 fn run_bindgen(
@@ -789,7 +801,7 @@ fn run_bindgen(
     pg_config: &PgConfig,
     include_h: &path::Path,
     enable_cshim: bool,
-) -> eyre::Result<String> {
+) -> eyre::Result<(Bindings, ClangAST)> {
     eprintln!("Generating bindings for pg{major_version}");
     let configure = pg_config.configure()?;
     let preferred_clang: Option<&std::path::Path> = configure.get("CLANG").map(|s| s.as_ref());
@@ -808,6 +820,8 @@ fn run_bindgen(
     let enum_names = Rc::new(RefCell::new(BTreeMap::new()));
     let overrides = BindingOverride::new_from(Rc::clone(&enum_names));
     let out_path = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+
+    let capture = StdoutCapture::start()?;
     let bindings = binder
         .header(include_h.display().to_string())
         .clang_args(extra_bindgen_clang_args(pg_config)?)
@@ -829,8 +843,10 @@ fn run_bindgen(
         .wrap_static_fns(enable_cshim)
         .wrap_static_fns_path(out_path.join("pgrx-cshim-static"))
         .wrap_static_fns_suffix("__pgrx_cshim")
+        .emit_clang_ast() // our `capture` slurps up the mess this emits rather than it actually going to stdout
         .generate()
         .wrap_err_with(|| format!("Unable to generate bindings for pg{major_version}"))?;
+    let clang_ast = capture.finish()?;
     let mut binding_str = bindings.to_string();
     drop(bindings); // So the Rc::into_inner can unwrap
 
@@ -857,7 +873,7 @@ pub const {module}_{variant}: {ty} = {value};"#,
         })
     }));
 
-    Ok(binding_str)
+    Ok((binding_str, clang_ast))
 }
 
 fn add_blocklists(bind: bindgen::Builder) -> bindgen::Builder {

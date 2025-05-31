@@ -2015,6 +2015,7 @@ dependencies = [
  "cc",
  "clang-sys",
  "eyre",
+ "libc",
  "pgrx-pg-config",
  "proc-macro2",
  "quote",
