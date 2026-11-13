@@ -85,6 +85,8 @@ jobs:
       CARGO_INCREMENTAL: 'false'
       CARGO_PROFILE_DEV_DEBUG: '0'
       CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG: '0'
+      # Linux installation paths describe the target, not MSYS2's host filesystem.
+      MSYS2_ENV_CONV_EXCL: 'TARGET_PG_;PGRX_PG_CONFIG_'
       CROSS_TARGET: ${{ matrix.target }}
       CROSS_OS: ${{ matrix.os }}
       CROSS_ARCH: ${{ matrix.arch }}
